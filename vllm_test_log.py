@@ -75,15 +75,23 @@ def main():
         except Exception:
             return 'unavailable'
 
+    # 只记录第0层(以及其子模块)的前向输入输出；通过名称包含“.0.”或以“.0”结尾来判断
     def make_hook(name):
         def hook(mod, inputs, output):
             io_cache[(name, 'in')] = to_meta(inputs)
             io_cache[(name, 'out')] = to_meta(output)
         return hook
 
+    def is_layer0(name: str) -> bool:
+        return ('.0.' in name) or name.endswith('.0')
+
     hooks = []
     if model is not None:
         for name, module in model.named_modules():
+            if not name:  # 跳过根模块
+                continue
+            if not is_layer0(name):
+                continue
             try:
                 hooks.append(module.register_forward_hook(make_hook(name)))
             except Exception:
@@ -95,7 +103,7 @@ def main():
         for o in out.outputs:
             print(o.text.rstrip())
 
-    # Print a small subset of captured IO metadata
+    # 只打印已捕获的前50条（仅来自第0层）
     printed = 0
     for (name, kind), meta in io_cache.items():
         print(f"[HOOK] {name} {kind}: {meta}")

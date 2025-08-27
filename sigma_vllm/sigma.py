@@ -27,12 +27,14 @@ from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
 
 from .interfaces import SupportsPP
+import os, datetime
 from .utils import (AutoWeightsLoader, extract_layer_index,
                     is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
 
 logger = init_logger(__name__)
+PROMPT_LEN = 127
 
 
 class SigmaMoeMLP(nn.Module):
@@ -101,37 +103,65 @@ class SigmaMoeMoE(nn.Module):
 
         self.num_experts_per_tok_layer_wise = getattr(config, 'num_experts_per_tok_layer_wise', None)
         
-        if self.num_experts_per_tok_layer_wise:
-            print(f"Using layer-wise experts, current layer index: {self.layer_idx}, current num experts per token: {self.num_experts_per_tok_layer_wise[self.layer_idx]}")
-            self.experts = FusedMoE(
-                num_experts=config.n_routed_experts,
-                top_k=self.num_experts_per_tok_layer_wise[self.layer_idx],
-                hidden_size=config.hidden_size,
-                intermediate_size=config.moe_intermediate_size,
-                reduce_results=False,
-                renormalize=config.norm_topk_prob,
-                quant_config=quant_config,
-                use_grouped_topk=True,
-                num_expert_group=1,
-                topk_group=1,
-                prefix=f"{prefix}.experts",
-                scoring_func=config.scoring_func,
-                e_score_correction_bias=self.gate.e_score_correction_bias)
-        else:
-            self.experts = FusedMoE(
-                num_experts=config.n_routed_experts,
-                top_k=config.num_experts_per_tok,
-                hidden_size=config.hidden_size,
-                intermediate_size=config.moe_intermediate_size,
-                reduce_results=False,
-                renormalize=config.norm_topk_prob,
-                quant_config=quant_config,
-                use_grouped_topk=True,
-                num_expert_group=1,
-                topk_group=1,
-                prefix=f"{prefix}.experts",
-                scoring_func=config.scoring_func,
-                e_score_correction_bias=self.gate.e_score_correction_bias)
+        # if self.num_experts_per_tok_layer_wise:
+        #     print(f"Using layer-wise experts, current layer index: {self.layer_idx}, current num experts per token: {self.num_experts_per_tok_layer_wise[self.layer_idx]}")
+        #     self.experts = FusedMoE(
+        #         num_experts=config.n_routed_experts,
+        #         top_k=self.num_experts_per_tok_layer_wise[self.layer_idx],
+        #         hidden_size=config.hidden_size,
+        #         intermediate_size=config.moe_intermediate_size,
+        #         reduce_results=False,
+        #         renormalize=config.norm_topk_prob,
+        #         quant_config=quant_config,
+        #         use_grouped_topk=True,
+        #         num_expert_group=1,
+        #         topk_group=1,
+        #         prefix=f"{prefix}.experts",
+        #         scoring_func=config.scoring_func,
+        #         e_score_correction_bias=self.gate.e_score_correction_bias)
+        # else:
+        #     self.experts = FusedMoE(
+        #         num_experts=config.n_routed_experts,
+        #         top_k=config.num_experts_per_tok,
+        #         hidden_size=config.hidden_size,
+        #         intermediate_size=config.moe_intermediate_size,
+        #         reduce_results=False,
+        #         renormalize=config.norm_topk_prob,
+        #         quant_config=quant_config,
+        #         use_grouped_topk=True,
+        #         num_expert_group=1,
+        #         topk_group=1,
+        #         prefix=f"{prefix}.experts",
+        #         scoring_func=config.scoring_func,
+        #         e_score_correction_bias=self.gate.e_score_correction_bias)
+        # self.experts = FusedMoE(
+        #     num_experts=config.n_routed_experts,
+        #     top_k=config.num_experts_per_tok,
+        #     hidden_size=config.hidden_size,
+        #     intermediate_size=config.moe_intermediate_size,
+        #     reduce_results=False,
+        #     renormalize=config.norm_topk_prob,
+        #     quant_config=quant_config,
+        #     use_grouped_topk=True,
+        #     num_expert_group=1,
+        #     topk_group=1,
+        #     prefix=f"{prefix}.experts",
+        #     scoring_func=config.scoring_func,
+        #     e_score_correction_bias=self.gate.e_score_correction_bias)
+        self.experts = FusedMoE(
+            num_experts=config.n_routed_experts,
+            top_k=config.num_experts_per_tok,
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            reduce_results=False,
+            renormalize=False,
+            quant_config=quant_config,
+            use_grouped_topk=True,
+            num_expert_group=1,
+            topk_group=1,
+            prefix=f"{prefix}.experts",
+            scoring_func='sigmoid',
+            e_score_correction_bias=self.gate.e_score_correction_bias)
 
         if self.n_shared_experts is not None and self.n_shared_experts > 0:
             intermediate_size = (config.moe_intermediate_size *
@@ -154,17 +184,47 @@ class SigmaMoeMoE(nn.Module):
             shared_output = self.shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        # if self.layer_idx == 0:
-        #     print("num tokens: ", num_tokens)
-        #     print(router_logits)
+        if self.layer_idx == 0 and num_tokens == PROMPT_LEN:
+            print("num tokens: ", num_tokens)
+            print(router_logits)
+            print(router_logits.shape)
+            save_dir = "/home/zhenghaolin/local_data/compare_cache/vllm"
+            os.makedirs(save_dir, exist_ok=True)
+            save_path = os.path.join(save_dir, f"router_logits_layer{self.layer_idx}_tokens{num_tokens}.pt")
+            try:
+                torch.save(router_logits.detach().cpu(), save_path)
+                print(f"Saved router_logits to {save_path}")
+            except Exception as e:
+                print(f"Failed to save router_logits: {e}")
 
         if hidden_states.dtype != torch.float16:
+            if self.layer_idx == 0 and num_tokens == PROMPT_LEN:
+                print("num tokens: ", num_tokens)
+                print(hidden_states.squeeze())
+                print(hidden_states.squeeze().shape)
+                save_dir = "/home/zhenghaolin/local_data/compare_cache/vllm"
+                os.makedirs(save_dir, exist_ok=True)
+                save_path = os.path.join(save_dir, f"expert_in_layer{self.layer_idx}_tokens{num_tokens}.pt")
+                try:
+                    torch.save(hidden_states.detach().cpu().squeeze(), save_path)
+                    print(f"Saved expert in tensor to {save_path}")
+                except Exception as e:
+                    print(f"Failed to save expert in tensor: {e}")
             final_hidden_states = self.experts(
                 hidden_states=hidden_states,
                 router_logits=router_logits) * self.routed_scaling_factor
-            if self.layer_idx == 0:
+            if self.layer_idx == 0 and num_tokens == PROMPT_LEN:
                 print("num tokens: ", num_tokens)
                 print(final_hidden_states)
+                print(final_hidden_states.shape)
+                save_dir = "/home/zhenghaolin/local_data/compare_cache/vllm"
+                os.makedirs(save_dir, exist_ok=True)
+                save_path = os.path.join(save_dir, f"expert_out_layer{self.layer_idx}_tokens{num_tokens}.pt")
+                try:
+                    torch.save(final_hidden_states.detach().cpu(), save_path)
+                    print(f"Saved final_hidden_states to {save_path}")
+                except Exception as e:
+                    print(f"Failed to save final_hidden_states: {e}")
         else:
             # Fix FP16 overflow
             # See DeepseekV2DecoderLayer for more details.
